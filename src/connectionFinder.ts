@@ -68,7 +68,7 @@ async function findConnectionUnix(): Promise<ConnectionInfo | null> {
         // Step 2: Get command line of found processes using ps
         for (const pid of pids) {
             try {
-                const { stdout: psOutput } = await execFileAsync('ps', ['-p', pid, '-o', 'args='], {
+                const { stdout: psOutput } = await execFileAsync('ps', ['-p', pid, '-ww', '-o', 'args='], {
                     timeout: CMD_TIMEOUT_MS,
                 });
 
