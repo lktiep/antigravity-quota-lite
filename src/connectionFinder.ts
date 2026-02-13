@@ -126,11 +126,15 @@ function parseCommandLine(cmdLine: string): ConnectionInfo | null {
 
     if (!portMatch?.[1] || !tokenMatch?.[1]) return null;
 
-    const port = parseInt(portMatch[1], 10);
-    if (port <= 0 || port > 65535) return null;
+    const extensionPort = parseInt(portMatch[1], 10);
+    if (extensionPort <= 0 || extensionPort > 65535) return null;
+
+    // The Language Server exposes the quota HTTP API on extension_server_port + 2.
+    // Port layout: extension_server_port (internal gRPC), +1 (HTTPS API), +2 (HTTP API)
+    const apiPort = extensionPort + 2;
 
     return {
-        port,
+        port: apiPort,
         csrfToken: tokenMatch[1],
     };
 }

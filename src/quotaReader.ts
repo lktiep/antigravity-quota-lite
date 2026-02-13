@@ -4,16 +4,14 @@
  * Fetches quota data from Antigravity's local Language Server API.
  * 
  * SECURITY NOTES:
- *   - Only connects to 127.0.0.1 (localhost), never external servers
- *   - rejectUnauthorized: false is necessary because Antigravity uses
- *     a self-signed certificate on localhost. This is safe because both
- *     endpoints are on the same machine — MITM is not possible without
- *     root access (at which point all bets are off anyway).
+ *   - Only connects to 127.0.0.1 (localhost) via HTTP, never external servers
+ *   - Uses HTTP (not HTTPS) because the Language Server's HTTP API port
+ *     runs on localhost only — no TLS needed for loopback traffic.
  *   - No data is ever sent to external servers
  *   - Read-only: we only GET data, never modify Antigravity state
  */
 
-import * as https from 'https';
+import * as http from 'http';
 import { ConnectionInfo, QuotaSnapshot, QuotaGroup, ModelQuotaInfo, RawUserStatusResponse } from './types';
 
 /** API endpoint path */
@@ -40,11 +38,11 @@ export async function fetchQuota(connection: ConnectionInfo): Promise<QuotaSnaps
 }
 
 /**
- * Send HTTPS POST to the local Language Server.
+ * Send HTTP POST to the local Language Server.
  */
 function httpPost<T>(connection: ConnectionInfo): Promise<T> {
     return new Promise((resolve, reject) => {
-        const opts: https.RequestOptions = {
+        const opts: http.RequestOptions = {
             hostname: '127.0.0.1',
             port: connection.port,
             path: API_PATH,
@@ -55,14 +53,11 @@ function httpPost<T>(connection: ConnectionInfo): Promise<T> {
                 'Connect-Protocol-Version': '1',
                 'X-Codeium-Csrf-Token': connection.csrfToken,
             },
-            // NOTE: Antigravity Language Server uses self-signed certificate on localhost.
-            // This is safe because we only ever connect to 127.0.0.1.
-            rejectUnauthorized: false,
             timeout: TIMEOUT_MS,
             agent: false,
         };
 
-        const req = https.request(opts, (res) => {
+        const req = http.request(opts, (res) => {
             let body = '';
             res.on('data', (chunk) => (body += chunk));
             res.on('end', () => {
