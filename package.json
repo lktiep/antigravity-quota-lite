@@ -1,0 +1,55 @@
+{
+  "name": "antigravity-quota-lite",
+  "displayName": "Antigravity Quota Lite",
+  "description": "Lightweight & safe quota monitor for Antigravity IDE — no OAuth, no telemetry, no process scanning",
+  "version": "1.0.0",
+  "publisher": "teplucky",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "keywords": ["antigravity", "quota", "monitor", "ai"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "quotaLite.showQuota",
+        "title": "Show Quota Details",
+        "category": "Quota Lite"
+      },
+      {
+        "command": "quotaLite.refresh",
+        "title": "Refresh Quota",
+        "category": "Quota Lite"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity Quota Lite",
+      "properties": {
+        "quotaLite.pollingIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "maximum": 600,
+          "description": "How often to refresh quota data (in seconds)"
+        },
+        "quotaLite.showInStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show quota summary in the status bar"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
