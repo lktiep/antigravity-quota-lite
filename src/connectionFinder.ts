@@ -24,12 +24,12 @@ import { ConnectionInfo } from './types';
 const execFileAsync = promisify(execFile);
 
 /** Known process names per platform */
-const PROCESS_NAMES: Record<string, string> = {
-    darwin_arm64: 'language_server_darwin_arm64',
-    darwin_x64: 'language_server_darwin_x64',
-    linux: 'language_server_linux_x64',
-    win32: 'language_server_windows_x64.exe',
-};
+/** 
+ * Search pattern for pgrep — matches any language_server variant:
+ *   language_server_macos_arm, language_server_macos_x64,
+ *   language_server_linux_x64, language_server_windows_x64, etc.
+ */
+const PGREP_PATTERN = 'language_server';
 
 /** Timeout for process discovery commands */
 const CMD_TIMEOUT_MS = 5000;
@@ -55,13 +55,10 @@ export async function findConnection(): Promise<ConnectionInfo | null> {
  * execFile is safe — arguments are passed as array, no shell interpretation.
  */
 async function findConnectionUnix(): Promise<ConnectionInfo | null> {
-    const targetName = process.platform === 'darwin'
-        ? (process.arch === 'arm64' ? PROCESS_NAMES.darwin_arm64 : PROCESS_NAMES.darwin_x64)
-        : PROCESS_NAMES.linux;
-
     try {
         // Step 1: Find PID using pgrep (safe, fixed arguments)
-        const { stdout: pidOutput } = await execFileAsync('pgrep', ['-f', targetName], {
+        // Searches for any process matching "language_server"
+        const { stdout: pidOutput } = await execFileAsync('pgrep', ['-f', PGREP_PATTERN], {
             timeout: CMD_TIMEOUT_MS,
         });
 
@@ -93,14 +90,12 @@ async function findConnectionUnix(): Promise<ConnectionInfo | null> {
  * Still uses execFile — the PowerShell command is a fixed string, not user input.
  */
 async function findConnectionWindows(): Promise<ConnectionInfo | null> {
-    const targetName = PROCESS_NAMES.win32;
-
     try {
         const { stdout } = await execFileAsync('powershell', [
             '-NoProfile',
             '-NonInteractive',
             '-Command',
-            `Get-CimInstance Win32_Process -Filter "name='${targetName}'" | Select-Object -ExpandProperty CommandLine`,
+            `Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'language_server*' } | Select-Object -ExpandProperty CommandLine`,
         ], {
             timeout: CMD_TIMEOUT_MS,
         });
