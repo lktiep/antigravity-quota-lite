@@ -1,9 +1,14 @@
 {
   "name": "antigravity-quota-lite",
   "displayName": "Antigravity Quota Lite",
-  "description": "Lightweight & safe quota monitor for Antigravity IDE — no OAuth, no telemetry, no process scanning",
+  "description": "Lightweight quota monitor for Antigravity IDE — no OAuth, no telemetry, no external connections",
   "version": "1.0.0",
   "publisher": "teplucky",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teplucky/antigravity-quota-lite"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -21,6 +26,11 @@
       {
         "command": "quotaLite.refresh",
         "title": "Refresh Quota",
+        "category": "Quota Lite"
+      },
+      {
+        "command": "quotaLite.diagnose",
+        "title": "Run Diagnostics",
         "category": "Quota Lite"
       }
     ],
@@ -45,7 +55,10 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx @vscode/vsce package --no-dependencies"
+    "lint": "tsc --noEmit",
+    "format": "npx prettier --write \"src/**/*.ts\"",
+    "format:check": "npx prettier --check \"src/**/*.ts\"",
+    "package": "npx @vscode/vsce package --no-dependencies --skip-license"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",

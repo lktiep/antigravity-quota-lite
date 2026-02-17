@@ -1,204 +1,266 @@
 /**
  * Antigravity Quota Lite — Extension Entry Point
- * 
- * A lightweight, safe quota monitor for Antigravity IDE.
- * 
- * What this extension does:
- *   ✅ Shows AI model quota usage in the status bar
- *   ✅ Click to see detailed breakdown per model
- *   ✅ Auto-refreshes on configurable interval
- * 
- * What this extension does NOT do:
- *   ❌ No OAuth / credential storage
- *   ❌ No external telemetry / error reporting
- *   ❌ No WebSocket connections
- *   ❌ No reading internal databases
- *   ❌ No shell injection risks (uses execFile, not exec)
+ *
+ * Lightweight quota monitor for Antigravity IDE.
+ * No OAuth, no telemetry, no external connections.
+ *
+ * Flow:
+ *   1. On activation, start looking for Antigravity Language Server
+ *   2. Once found, poll GetUserStatus for quota data
+ *   3. Display in status bar, click for QuickPick details
  */
 
-import * as vscode from 'vscode';
-import { findConnection } from './connectionFinder';
-import { fetchQuota } from './quotaReader';
-import { StatusBarController } from './statusBar';
-import { showQuotaQuickPick } from './quickPick';
-import { ConnectionInfo, QuotaSnapshot } from './types';
+import * as vscode from "vscode";
+import { findConnection } from "./connectionFinder";
+import { fetchQuota, fetchQuotaRaw } from "./quotaReader";
+import { StatusBarController } from "./statusBar";
+import { showQuotaQuickPick } from "./quickPick";
+import { ConnectionInfo } from "./types";
 
-/** Output channel for logging (user-visible, no external sending) */
+// ─── State ───────────────────────────────────────────────────────────
+
 let outputChannel: vscode.OutputChannel;
-
-/** Core state */
 let statusBar: StatusBarController;
-let connection: ConnectionInfo | null = null;
-let pollingTimer: ReturnType<typeof setInterval> | undefined;
-let lastSnapshot: QuotaSnapshot | undefined;
+let currentConnection: ConnectionInfo | null = null;
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+let isActive = false;
 
-/** Retry state for connection discovery */
-let connectionRetryCount = 0;
-const MAX_CONNECTION_RETRIES = 5;
-const CONNECTION_RETRY_DELAY_MS = 10000;
+/** Track consecutive fetch failures to avoid infinite reconnect loops */
+let consecutiveFailures = 0;
+const MAX_CONSECUTIVE_FAILURES = 5;
 
-/**
- * Extension activation
- */
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    // Create output channel for local-only logging
-    outputChannel = vscode.window.createOutputChannel('Quota Lite');
-    log('Antigravity Quota Lite — activating');
+// ─── Lifecycle ───────────────────────────────────────────────────────
 
-    // Initialize status bar
-    statusBar = new StatusBarController();
-    context.subscriptions.push({ dispose: () => statusBar.dispose() });
+export function activate(context: vscode.ExtensionContext): void {
+  outputChannel = vscode.window.createOutputChannel("Quota Lite");
+  log("Antigravity Quota Lite activating...");
 
-    // Register commands
-    context.subscriptions.push(
-        vscode.commands.registerCommand('quotaLite.showQuota', () => {
-            showQuotaQuickPick(statusBar.getLastSnapshot(), () => refreshQuota());
-        }),
-    );
+  statusBar = new StatusBarController();
+  context.subscriptions.push({ dispose: () => statusBar.dispose() });
 
-    context.subscriptions.push(
-        vscode.commands.registerCommand('quotaLite.refresh', () => {
-            refreshQuota();
-        }),
-    );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("quotaLite.showQuota", () => {
+      showQuotaQuickPick(statusBar.getLastSnapshot(), () => refreshQuota());
+    }),
+    vscode.commands.registerCommand("quotaLite.refresh", () => refreshQuota()),
+    vscode.commands.registerCommand("quotaLite.diagnose", () =>
+      runDiagnostics(),
+    ),
+  );
 
-    // Watch for config changes
-    context.subscriptions.push(
-        vscode.workspace.onDidChangeConfiguration((e) => {
-            if (e.affectsConfiguration('quotaLite')) {
-                restartPolling();
-            }
-        }),
-    );
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("quotaLite")) {
+        log("Configuration changed, restarting poll...");
+        startPolling();
+      }
+    }),
+  );
 
-    // Start connection discovery and polling
-    await startSystem();
+  isActive = true;
+  startConnectionDiscovery();
 }
 
-/**
- * Extension deactivation — clean shutdown
- */
 export function deactivate(): void {
-    stopPolling();
-    log('Antigravity Quota Lite — deactivated');
+  isActive = false;
+  stopPolling();
 }
 
-/**
- * Start the system: find connection → start polling
- */
-async function startSystem(): Promise<void> {
-    statusBar.showOffline();
-    connectionRetryCount = 0;
+// ─── Connection Discovery ────────────────────────────────────────────
 
-    await discoverConnection();
-}
+async function startConnectionDiscovery(): Promise<void> {
+  log("Searching for Antigravity Language Server...");
+  statusBar.showOffline();
 
-/**
- * Discover Antigravity Language Server connection.
- * Retries with backoff if not found.
- */
-async function discoverConnection(): Promise<void> {
-    log('Searching for Antigravity Language Server...');
-
-    connection = await findConnection();
-
-    if (connection) {
-        log(`Connected to Language Server on port ${connection.port}`);
-        connectionRetryCount = 0;
-        startPolling();
-        // Immediately fetch first data
-        await refreshQuota();
-    } else {
-        connectionRetryCount++;
-        if (connectionRetryCount <= MAX_CONNECTION_RETRIES) {
-            const delay = CONNECTION_RETRY_DELAY_MS * connectionRetryCount;
-            log(`Language Server not found. Retry ${connectionRetryCount}/${MAX_CONNECTION_RETRIES} in ${delay / 1000}s`);
-            statusBar.showError('Looking for Antigravity...');
-            setTimeout(() => discoverConnection(), delay);
-        } else {
-            log('Could not find Antigravity Language Server after retries');
-            statusBar.showError('Antigravity not found — is it running?');
-        }
-    }
-}
-
-/**
- * Refresh quota data from Language Server.
- */
-async function refreshQuota(): Promise<void> {
-    if (!connection) {
-        // Try to rediscover connection
-        connection = await findConnection();
-        if (!connection) {
-            statusBar.showError('Antigravity not connected');
-            return;
-        }
-        log(`Reconnected on port ${connection.port}`);
-    }
-
+  const maxAttempts = 10;
+  for (let i = 0; i < maxAttempts && isActive; i++) {
     try {
-        lastSnapshot = await fetchQuota(connection);
-        statusBar.update(lastSnapshot);
-
-        const modelCount = lastSnapshot.models.length;
-        const groupCount = lastSnapshot.groups.length;
-        log(`Quota updated: ${modelCount} models in ${groupCount} groups`);
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        log(`Quota fetch failed: ${message}`);
-
-        // If connection failed, try to rediscover
-        if (message.includes('Connection failed') || message.includes('timed out')) {
-            log('Connection lost, attempting rediscovery...');
-            connection = null;
-            statusBar.showError('Reconnecting...');
-            await discoverConnection();
-        } else {
-            statusBar.showError(message);
-        }
-    }
-}
-
-/**
- * Start periodic polling.
- */
-function startPolling(): void {
-    stopPolling();
-
-    const config = vscode.workspace.getConfiguration('quotaLite');
-    const intervalSec = config.get<number>('pollingIntervalSeconds', 60);
-    const intervalMs = Math.max(10000, intervalSec * 1000); // Minimum 10s
-
-    log(`Polling started: every ${intervalSec}s`);
-
-    pollingTimer = setInterval(() => {
-        refreshQuota();
-    }, intervalMs);
-}
-
-/**
- * Stop polling.
- */
-function stopPolling(): void {
-    if (pollingTimer) {
-        clearInterval(pollingTimer);
-        pollingTimer = undefined;
-    }
-}
-
-/**
- * Restart polling (e.g. after config change).
- */
-function restartPolling(): void {
-    if (connection) {
+      const connection = await findConnection();
+      if (connection) {
+        log(
+          `✅ Connected! Port: ${connection.port}, Token: ${connection.csrfToken.substring(0, 8)}...`,
+        );
+        currentConnection = connection;
+        consecutiveFailures = 0;
         startPolling();
+        return;
+      }
+    } catch (e) {
+      log(
+        `Attempt ${i + 1}/${maxAttempts} failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
+
+    // Exponential backoff capped at 10s
+    await sleep(Math.min(2000 + i * 1000, 10000));
+  }
+
+  log("Language Server not found after all attempts");
+  statusBar.showError("Antigravity not found — is it running?");
+
+  // Background retry every 30s
+  setTimeout(() => {
+    if (isActive && !currentConnection) startConnectionDiscovery();
+  }, 30_000);
 }
 
-/**
- * Log to output channel (local only, never sent externally).
- */
+// ─── Polling ─────────────────────────────────────────────────────────
+
+function startPolling(): void {
+  stopPolling();
+  consecutiveFailures = 0;
+
+  const config = vscode.workspace.getConfiguration("quotaLite");
+  const intervalSec = config.get<number>("pollingIntervalSeconds", 60);
+  const intervalMs = Math.max(intervalSec * 1000, 10_000);
+
+  log(`Polling every ${intervalSec}s`);
+  refreshQuota();
+  pollTimer = setInterval(() => refreshQuota(), intervalMs);
+}
+
+function stopPolling(): void {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = undefined;
+  }
+}
+
+// ─── Quota Refresh ───────────────────────────────────────────────────
+
+async function refreshQuota(): Promise<void> {
+  if (!currentConnection) {
+    log("No connection, skipping refresh");
+    return;
+  }
+
+  try {
+    const snapshot = await fetchQuota(currentConnection);
+    consecutiveFailures = 0;
+    statusBar.update(snapshot);
+    log(
+      `Quota updated: ${snapshot.models.length} models, ${snapshot.groups.length} groups`,
+    );
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    log(`Quota fetch failed: ${message}`);
+
+    if (isConnectionError(message)) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        log(
+          `${MAX_CONSECUTIVE_FAILURES} consecutive failures, reconnecting...`,
+        );
+        currentConnection = null;
+        statusBar.showError("Reconnecting...");
+        startConnectionDiscovery();
+      }
+    }
+  }
+}
+
+function isConnectionError(msg: string): boolean {
+  return (
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("Connection Failed") ||
+    msg.includes("timed out")
+  );
+}
+
+// ─── Diagnostics ─────────────────────────────────────────────────────
+
+async function runDiagnostics(): Promise<void> {
+  outputChannel.show(true);
+  log("=== DIAGNOSTICS START ===");
+  log(`Platform: ${process.platform}, Arch: ${process.arch}`);
+  log(`Node: ${process.version}, PID: ${process.pid}`);
+
+  log("Testing findConnection()...");
+  try {
+    const conn = await findConnection();
+    if (conn) {
+      log(
+        `✅ Found connection: port=${conn.port}, token=${conn.csrfToken.substring(0, 8)}...`,
+      );
+
+      log("Fetching raw response...");
+      try {
+        const raw = await fetchQuotaRaw(conn);
+        logRawInspection(raw);
+      } catch (e) {
+        log(
+          `❌ Raw fetch error: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+
+      log("Testing fetchQuota() (parsed)...");
+      try {
+        const quota = await fetchQuota(conn);
+        log(
+          `✅ Parsed: ${quota.models.length} models, ${quota.groups.length} groups`,
+        );
+        for (const m of quota.models.slice(0, 5)) {
+          log(`  - ${m.label}: ${(m.remainingPercentage ?? 0).toFixed(1)}%`);
+        }
+      } catch (e) {
+        log(
+          `❌ fetchQuota error: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    } else {
+      log("❌ findConnection returned null");
+    }
+  } catch (e) {
+    log(
+      `❌ findConnection error: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+
+  log("=== DIAGNOSTICS END ===");
+  vscode.window.showInformationMessage(
+    "Diagnostics complete — check Output → Quota Lite",
+  );
+}
+
+/** Log inspection of raw API response for debugging */
+function logRawInspection(raw: any): void {
+  const topKeys = Object.keys(raw || {});
+  log(`Raw top-level keys: ${JSON.stringify(topKeys)}`);
+
+  if (!raw?.userStatus) {
+    log("⚠️ No userStatus in response!");
+    log(`Preview: ${JSON.stringify(raw).substring(0, 500)}`);
+    return;
+  }
+
+  const statusKeys = Object.keys(raw.userStatus);
+  log(`userStatus keys: ${JSON.stringify(statusKeys)}`);
+
+  const configData = raw.userStatus.cascadeModelConfigData;
+  if (!configData) {
+    log("⚠️ No cascadeModelConfigData in userStatus");
+    return;
+  }
+
+  log(
+    `cascadeModelConfigData keys: ${JSON.stringify(Object.keys(configData))}`,
+  );
+  const configs = configData.clientModelConfigs || [];
+  log(`clientModelConfigs count: ${configs.length}`);
+
+  for (const m of configs.slice(0, 3)) {
+    log(
+      `  Model: label=${m.label}, id=${m.modelOrAlias?.model}, fraction=${m.quotaInfo?.remainingFraction}`,
+    );
+  }
+}
+
+// ─── Utilities ───────────────────────────────────────────────────────
+
 function log(message: string): void {
-    const timestamp = new Date().toLocaleTimeString();
-    outputChannel.appendLine(`[${timestamp}] ${message}`);
+  outputChannel.appendLine(`[${new Date().toLocaleTimeString()}] ${message}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }

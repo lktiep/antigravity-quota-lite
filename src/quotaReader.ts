@@ -1,205 +1,301 @@
 /**
  * Antigravity Quota Lite — Quota Reader
- * 
- * Fetches quota data from Antigravity's local Language Server API.
- * 
- * SECURITY NOTES:
- *   - Only connects to 127.0.0.1 (localhost) via HTTP, never external servers
- *   - Uses HTTP (not HTTPS) because the Language Server's HTTP API port
- *     runs on localhost only — no TLS needed for loopback traffic.
- *   - No data is ever sent to external servers
- *   - Read-only: we only GET data, never modify Antigravity state
+ * Ported exactly from vscode-antigravity-cockpit reactor.ts:
+ *   - transmit()           → httpsPost()
+ *   - fetchLocalTelemetry() → fetchQuota()
+ *   - decodeSignal()        → decodeSignal()
  */
 
-import * as http from 'http';
-import { ConnectionInfo, QuotaSnapshot, QuotaGroup, ModelQuotaInfo, RawUserStatusResponse } from './types';
+import * as https from "https";
+import {
+  ConnectionInfo,
+  QuotaSnapshot,
+  ModelQuotaInfo,
+  QuotaGroup,
+  PromptCreditsInfo,
+  ServerUserStatusResponse,
+  ClientModelConfig,
+} from "./types";
 
-/** API endpoint path */
-const API_PATH = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+// ─── Constants (from constants.ts) ───────────────────────────────────
 
-/** Request timeout */
-const TIMEOUT_MS = 8000;
+const API_ENDPOINT =
+  "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+const HTTP_TIMEOUT = 10000;
 
-/** Request body — read-only status query */
-const REQUEST_BODY = JSON.stringify({
-    metadata: {
-        ideName: 'antigravity',
-        extensionName: 'antigravity',
-        locale: 'en',
+// ─── Public API ──────────────────────────────────────────────────────
+
+/**
+ * Fetch quota data from the Antigravity Language Server.
+ * Exact port of ReactorCore.fetchLocalTelemetry().
+ */
+export async function fetchQuota(
+  connection: ConnectionInfo,
+): Promise<QuotaSnapshot> {
+  const raw = await httpsPost<ServerUserStatusResponse>(
+    connection.port,
+    connection.csrfToken,
+    API_ENDPOINT,
+    {
+      metadata: {
+        ideName: "antigravity",
+        extensionName: "antigravity",
+        locale: "en",
+      },
     },
-});
+  );
 
-/**
- * Fetch current quota snapshot from Antigravity Language Server.
- */
-export async function fetchQuota(connection: ConnectionInfo): Promise<QuotaSnapshot> {
-    const raw = await httpPost<RawUserStatusResponse>(connection);
-    return parseResponse(raw);
+  return decodeSignal(raw);
 }
 
 /**
- * Send HTTP POST to the local Language Server.
+ * Fetch raw response for diagnostics (no parsing).
  */
-function httpPost<T>(connection: ConnectionInfo): Promise<T> {
-    return new Promise((resolve, reject) => {
-        const opts: http.RequestOptions = {
-            hostname: '127.0.0.1',
-            port: connection.port,
-            path: API_PATH,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(REQUEST_BODY),
-                'Connect-Protocol-Version': '1',
-                'X-Codeium-Csrf-Token': connection.csrfToken,
-            },
-            timeout: TIMEOUT_MS,
-            agent: false,
-        };
+export async function fetchQuotaRaw(connection: ConnectionInfo): Promise<any> {
+  return await httpsPost<any>(
+    connection.port,
+    connection.csrfToken,
+    API_ENDPOINT,
+    {
+      metadata: {
+        ideName: "antigravity",
+        extensionName: "antigravity",
+        locale: "en",
+      },
+    },
+  );
+}
 
-        const req = http.request(opts, (res) => {
-            let body = '';
-            res.on('data', (chunk) => (body += chunk));
-            res.on('end', () => {
-                if (!body || body.trim().length === 0) {
-                    reject(new Error('Empty response from Language Server'));
-                    return;
-                }
-                try {
-                    resolve(JSON.parse(body) as T);
-                } catch {
-                    reject(new Error('Invalid JSON response from Language Server'));
-                }
-            });
-        });
+// ─── HTTPS Transport (from ReactorCore.transmit) ─────────────────────
 
-        req.on('error', (e) => reject(new Error(`Connection failed: ${e.message}`)));
-        req.on('timeout', () => {
-            req.destroy();
-            reject(new Error('Request timed out'));
-        });
+/**
+ * Make HTTPS POST to local language server.
+ * Exact port of ReactorCore.transmit().
+ */
+function httpsPost<T>(
+  port: number,
+  token: string,
+  endpoint: string,
+  payload: object,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(payload);
 
-        req.write(REQUEST_BODY);
-        req.end();
+    const opts: https.RequestOptions = {
+      hostname: "127.0.0.1",
+      port,
+      path: endpoint,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+        "Connect-Protocol-Version": "1",
+        "X-Codeium-Csrf-Token": token,
+      },
+      rejectUnauthorized: false,
+      timeout: HTTP_TIMEOUT,
+      agent: false, // Bypass proxy, connect directly to localhost
+    };
+
+    const req = https.request(opts, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks);
+        const statusCode = res.statusCode;
+        const contentType = res.headers["content-type"] || "unknown";
+
+        // Try JSON parse
+        const bodyStr = raw.toString("utf-8");
+        try {
+          resolve(JSON.parse(bodyStr) as T);
+        } catch {
+          // Show detailed debug info
+          const hexPreview = raw.slice(0, 32).toString("hex");
+          reject(
+            new Error(
+              `Non-JSON response from :${port}${endpoint}. ` +
+                `Status: ${statusCode}, Content-Type: ${contentType}, ` +
+                `Size: ${raw.length}B, Hex[0:32]: ${hexPreview}, ` +
+                `Text[0:200]: ${bodyStr.substring(0, 200)}`,
+            ),
+          );
+        }
+      });
     });
+
+    req.on("error", (e) =>
+      reject(new Error(`Connection Failed: ${e.message}`)),
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Request timed out"));
+    });
+
+    req.write(data);
+    req.end();
+  });
 }
 
+// ─── Response Decoding (from ReactorCore.decodeSignal) ───────────────
+
 /**
- * Parse raw API response into our clean QuotaSnapshot format.
+ * Decode server response into QuotaSnapshot.
+ * Exact port of ReactorCore.decodeSignal().
  */
-function parseResponse(raw: RawUserStatusResponse): QuotaSnapshot {
-    const models: ModelQuotaInfo[] = [];
+function decodeSignal(data: ServerUserStatusResponse): QuotaSnapshot {
+  // Validate response structure
+  if (!data || !data.userStatus) {
+    if (data && typeof (data as any).message === "string") {
+      throw new Error(`Server error: ${(data as any).message}`);
+    }
+    throw new Error(
+      `Invalid response: ${data ? JSON.stringify(data).substring(0, 100) : "empty"}`,
+    );
+  }
 
-    // Parse ideChatModels (primary source in newer API versions)
-    if (raw.ideChatModels && Array.isArray(raw.ideChatModels)) {
-        for (const m of raw.ideChatModels) {
-            const info = parseModelQuota(m);
-            if (info) models.push(info);
-        }
+  const status = data.userStatus;
+  const plan = status.planStatus?.planInfo;
+  const credits = status.planStatus?.availablePromptCredits;
+
+  // Parse prompt credits
+  let promptCredits: PromptCreditsInfo | undefined;
+  if (plan && credits !== undefined) {
+    const monthlyLimit = Number(plan.monthlyPromptCredits);
+    const availableVal = Number(credits);
+
+    if (monthlyLimit > 0) {
+      promptCredits = {
+        available: availableVal,
+        monthly: monthlyLimit,
+        usedPercentage: ((monthlyLimit - availableVal) / monthlyLimit) * 100,
+        remainingPercentage: (availableVal / monthlyLimit) * 100,
+      };
+    }
+  }
+
+  // Parse models from cascadeModelConfigData.clientModelConfigs
+  const configs: ClientModelConfig[] =
+    status.cascadeModelConfigData?.clientModelConfigs || [];
+
+  const models: ModelQuotaInfo[] = configs
+    .filter(
+      (
+        m,
+      ): m is ClientModelConfig & {
+        quotaInfo: NonNullable<ClientModelConfig["quotaInfo"]>;
+      } => !!m.quotaInfo,
+    )
+    .map((m) => {
+      const now = new Date();
+      let reset = new Date(m.quotaInfo.resetTime);
+      let resetTimeValid = true;
+
+      if (Number.isNaN(reset.getTime())) {
+        reset = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        resetTimeValid = false;
+      }
+
+      const delta = reset.getTime() - now.getTime();
+
+      return {
+        label: m.label,
+        modelId: m.modelOrAlias?.model || "unknown",
+        remainingFraction: m.quotaInfo.remainingFraction,
+        remainingPercentage:
+          m.quotaInfo.remainingFraction !== undefined
+            ? m.quotaInfo.remainingFraction * 100
+            : undefined,
+        isExhausted: m.quotaInfo.remainingFraction === 0,
+        resetTime: reset,
+        resetTimeDisplay: resetTimeValid ? formatIso(reset) : "Unknown",
+        timeUntilReset: delta,
+        timeUntilResetFormatted: resetTimeValid
+          ? formatDelta(delta)
+          : "Unknown",
+        resetTimeValid,
+        supportsImages: m.supportsImages,
+        isRecommended: m.isRecommended,
+        tagTitle: m.tagTitle,
+      };
+    });
+
+  // Sort using clientModelSorts if available
+  const modelSorts = status.cascadeModelConfigData?.clientModelSorts || [];
+  if (modelSorts.length > 0) {
+    const sortOrderMap = new Map<string, number>();
+    const primarySort = modelSorts[0];
+    let index = 0;
+    for (const group of primarySort.groups) {
+      for (const label of group.modelLabels) {
+        sortOrderMap.set(label, index++);
+      }
     }
 
-    // Parse promptCredits.models (fallback for older API versions)
-    if (models.length === 0 && raw.promptCredits?.models && Array.isArray(raw.promptCredits.models)) {
-        for (const m of raw.promptCredits.models) {
-            const info = parseModelQuota(m);
-            if (info) models.push(info);
-        }
-    }
+    models.sort((a, b) => {
+      const indexA = sortOrderMap.get(a.label);
+      const indexB = sortOrderMap.get(b.label);
+      if (indexA !== undefined && indexB !== undefined) return indexA - indexB;
+      if (indexA !== undefined) return -1;
+      if (indexB !== undefined) return 1;
+      return a.label.localeCompare(b.label);
+    });
+  }
 
-    // If still no models but we have overall prompt credits, create a summary entry
-    if (models.length === 0 && raw.promptCredits) {
-        const pc = raw.promptCredits;
-        if (pc.remaining !== undefined && pc.total !== undefined && pc.total > 0) {
-            models.push({
-                label: 'Prompt Credits',
-                modelId: 'prompt_credits',
-                remainingPercentage: (pc.remaining / pc.total) * 100,
-                resetTime: pc.expiresAt,
-            });
-        }
-    }
+  // Build groups
+  const groups = buildGroups(models);
 
-    // Group models intelligently
-    const groups = groupModels(models);
-
-    return {
-        groups,
-        models,
-        fetchedAt: Date.now(),
-        fromCache: false,
-    };
+  return {
+    models,
+    groups,
+    promptCredits,
+    fetchedAt: Date.now(),
+    fromCache: false,
+  };
 }
 
-/**
- * Parse a single model's quota data.
- */
-function parseModelQuota(raw: { label?: string; model?: string; limits?: { remaining?: number; total?: number; expiresAt?: string }; quotaInfo?: { remainingFraction?: number; resetTime?: string } }): ModelQuotaInfo | null {
-    const label = raw.label || raw.model;
-    if (!label) return null;
+// ─── Grouping ────────────────────────────────────────────────────────
 
-    let remainingPercentage = 0;
-    let resetTime: string | undefined;
+function buildGroups(models: ModelQuotaInfo[]): QuotaGroup[] {
+  if (models.length === 0) return [];
 
-    // Prefer quotaInfo (authorized API format)
-    if (raw.quotaInfo?.remainingFraction !== undefined) {
-        remainingPercentage = raw.quotaInfo.remainingFraction * 100;
-        resetTime = raw.quotaInfo.resetTime;
-    }
-    // Fallback to limits (local API format)
-    else if (raw.limits?.remaining !== undefined && raw.limits?.total !== undefined && raw.limits.total > 0) {
-        remainingPercentage = (raw.limits.remaining / raw.limits.total) * 100;
-        resetTime = raw.limits.expiresAt;
-    }
+  // Group by quota fingerprint (remainingFraction + resetTime)
+  const fingerprints = new Map<string, ModelQuotaInfo[]>();
+  for (const model of models) {
+    const fraction = (model.remainingFraction ?? 0).toFixed(6);
+    const resetTime = model.resetTime.getTime();
+    const key = `${fraction}_${resetTime}`;
+    if (!fingerprints.has(key)) fingerprints.set(key, []);
+    fingerprints.get(key)!.push(model);
+  }
 
-    return {
-        label,
-        modelId: raw.model || label,
-        remainingPercentage: Math.max(0, Math.min(100, remainingPercentage)),
-        resetTime,
-    };
+  const groups: QuotaGroup[] = [];
+  let groupIndex = 1;
+  for (const [, groupModels] of fingerprints) {
+    const name =
+      groupModels.length === 1 ? groupModels[0].label : `Group ${groupIndex}`;
+    groups.push({ name, models: groupModels });
+    groupIndex++;
+  }
+
+  return groups;
 }
 
-/**
- * Group models by common prefix patterns.
- * E.g. "Gemini 3 Pro (High)" and "Gemini 3 Pro (Low)" → "Gemini 3 Pro"
- */
-function groupModels(models: ModelQuotaInfo[]): QuotaGroup[] {
-    if (models.length === 0) return [];
-    if (models.length <= 3) {
-        return [{ name: 'All Models', models }];
-    }
+// ─── Time Formatting ─────────────────────────────────────────────────
 
-    const groups = new Map<string, ModelQuotaInfo[]>();
-
-    for (const model of models) {
-        const groupName = inferGroupName(model.label);
-        if (!groups.has(groupName)) {
-            groups.set(groupName, []);
-        }
-        groups.get(groupName)!.push(model);
-    }
-
-    return Array.from(groups.entries()).map(([name, groupModels]) => ({
-        name,
-        models: groupModels,
-    }));
+function formatIso(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-/**
- * Infer group name from model label.
- */
-function inferGroupName(label: string): string {
-    // Remove variant indicators in parentheses
-    const base = label.replace(/\s*\([^)]*\)\s*$/, '').trim();
+function formatDelta(ms: number): string {
+  if (ms <= 0) return "now";
 
-    // Known group patterns
-    if (/gemini\s*3\s*pro/i.test(base)) return 'Gemini 3 Pro';
-    if (/gemini\s*3\s*flash/i.test(base)) return 'Gemini 3 Flash';
-    if (/gemini/i.test(base)) return 'Gemini';
-    if (/claude\s*sonnet/i.test(base)) return 'Claude Sonnet';
-    if (/claude\s*opus/i.test(base)) return 'Claude Opus';
-    if (/claude/i.test(base)) return 'Claude';
-    if (/gpt/i.test(base)) return 'GPT';
+  const hours = Math.floor(ms / (1000 * 60 * 60));
+  const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
 
-    return base;
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  return `${minutes}m`;
 }

@@ -1,140 +1,264 @@
 /**
  * Antigravity Quota Lite — Connection Finder
- * 
- * SAFE approach to find Antigravity Language Server port + CSRF token.
- * 
- * Strategy (in order of preference):
- *   1. Read from Antigravity's process args via `execFile('pgrep', ...)`
- *      → Uses execFile (NOT exec) to prevent shell injection
- *      → Only searches for the specific Antigravity process name
- *   2. Fallback: User-configured values in VS Code settings
- * 
- * SECURITY: Unlike the original extension, we:
- *   - Use execFile (no shell interpretation, immune to injection)
- *   - Only look for one specific process by name
- *   - Never list ALL system processes
- *   - No reading of internal SQLite databases
+ * Ported exactly from vscode-antigravity-cockpit hunter.ts + strategies.ts
+ *
+ * Flow:
+ *   1. ps -ww -eo pid,ppid,args | grep "language_server_macos_arm" | grep -v grep
+ *   2. Parse: extract PID, --extension_server_port, --csrf_token
+ *   3. Validate: must have --app_data_dir antigravity
+ *   4. lsof -nP -a -iTCP -sTCP:LISTEN -p $PID | grep PID
+ *   5. For each port: HTTPS POST to /GetUnleashData → if 200, it's the right port
+ *   6. Return { port, csrfToken }
  */
 
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import * as process from 'process';
-import { ConnectionInfo } from './types';
+import { exec } from "child_process";
+import { promisify } from "util";
+import * as https from "https";
+import * as process from "process";
+import { ConnectionInfo, ProcessInfo } from "./types";
 
-const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 
-/** Known process names per platform */
-/** 
- * Search pattern for pgrep — matches any language_server variant:
- *   language_server_macos_arm, language_server_macos_x64,
- *   language_server_linux_x64, language_server_windows_x64, etc.
- */
-const PGREP_PATTERN = 'language_server';
+// ─── Constants (from constants.ts) ───────────────────────────────────
 
-/** Timeout for process discovery commands */
-const CMD_TIMEOUT_MS = 5000;
+const PROCESS_NAMES = {
+  darwin_arm: "language_server_macos_arm",
+  darwin_x64: "language_server_macos",
+  linux: "language_server_linux",
+} as const;
+
+const API_ENDPOINTS = {
+  GET_UNLEASH_DATA:
+    "/exa.language_server_pb.LanguageServerService/GetUnleashData",
+} as const;
+
+const PROCESS_CMD_TIMEOUT_MS = 15000;
+const PROCESS_SCAN_RETRY_MS = 100;
+const PING_TIMEOUT = 10000;
+const MAX_ATTEMPTS = 3;
 
 /**
- * Find Antigravity Language Server connection info safely.
- * Returns null if not found.
+ * Find connection to the running Antigravity Language Server.
+ * Exactly follows ProcessHunter.scanEnvironment logic.
  */
 export async function findConnection(): Promise<ConnectionInfo | null> {
-    try {
-        if (process.platform === 'win32') {
-            return await findConnectionWindows();
-        } else {
-            return await findConnectionUnix();
-        }
-    } catch {
-        return null;
-    }
-}
-
-/**
- * macOS / Linux: Use pgrep + ps to find the process.
- * execFile is safe — arguments are passed as array, no shell interpretation.
- */
-async function findConnectionUnix(): Promise<ConnectionInfo | null> {
-    try {
-        // Step 1: Find PID using pgrep (safe, fixed arguments)
-        // Searches for any process matching "language_server"
-        const { stdout: pidOutput } = await execFileAsync('pgrep', ['-f', PGREP_PATTERN], {
-            timeout: CMD_TIMEOUT_MS,
-        });
-
-        const pids = pidOutput.trim().split('\n').filter(Boolean);
-        if (pids.length === 0) return null;
-
-        // Step 2: Get command line of found processes using ps
-        for (const pid of pids) {
-            try {
-                const { stdout: psOutput } = await execFileAsync('ps', ['-p', pid, '-ww', '-o', 'args='], {
-                    timeout: CMD_TIMEOUT_MS,
-                });
-
-                const result = parseCommandLine(psOutput);
-                if (result) return result;
-            } catch {
-                // Process may have exited, continue
-            }
-        }
-    } catch {
-        // pgrep returned no results or errored
-    }
-
+  // Determine target process name based on platform & arch
+  let targetProcess: string;
+  if (process.platform === "darwin") {
+    targetProcess =
+      process.arch === "arm64"
+        ? PROCESS_NAMES.darwin_arm
+        : PROCESS_NAMES.darwin_x64;
+  } else if (process.platform === "linux") {
+    targetProcess = PROCESS_NAMES.linux;
+  } else {
+    // Windows not supported in lite version
     return null;
-}
+  }
 
-/**
- * Windows: Use PowerShell Get-CimInstance with fixed filter.
- * Still uses execFile — the PowerShell command is a fixed string, not user input.
- */
-async function findConnectionWindows(): Promise<ConnectionInfo | null> {
+  // Phase 1: Scan by process name (up to MAX_ATTEMPTS)
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
     try {
-        const { stdout } = await execFileAsync('powershell', [
-            '-NoProfile',
-            '-NonInteractive',
-            '-Command',
-            `Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'language_server*' } | Select-Object -ExpandProperty CommandLine`,
-        ], {
-            timeout: CMD_TIMEOUT_MS,
-        });
+      // Exact command from UnixStrategy.getProcessListCommand
+      const cmd = `ps -ww -eo pid,ppid,args | grep "${targetProcess}" | grep -v grep`;
+      const { stdout } = await execAsync(cmd, {
+        timeout: PROCESS_CMD_TIMEOUT_MS,
+      });
 
-        return parseCommandLine(stdout);
+      if (!stdout || !stdout.trim()) {
+        continue;
+      }
+
+      const candidates = parseProcessInfo(stdout);
+
+      if (candidates.length > 0) {
+        // Try each candidate
+        for (const info of candidates) {
+          const result = await verifyAndConnect(info);
+          if (result) {
+            return result;
+          }
+        }
+      }
     } catch {
-        return null;
+      // Process not found or command failed, retry
     }
+
+    if (i < MAX_ATTEMPTS - 1) {
+      await new Promise((r) => setTimeout(r, PROCESS_SCAN_RETRY_MS));
+    }
+  }
+
+  return null;
+}
+
+// ─── Process Parsing (from UnixStrategy.parseProcessInfo) ────────────
+
+/**
+ * Check if a command line belongs to Antigravity.
+ * Must have ALL THREE: --extension_server_port, --csrf_token, --app_data_dir antigravity
+ */
+function isAntigravityProcess(commandLine: string): boolean {
+  if (!commandLine.includes("--extension_server_port")) return false;
+  if (!commandLine.includes("--csrf_token")) return false;
+  return /--app_data_dir\s+antigravity\b/i.test(commandLine);
 }
 
 /**
- * Extract port and CSRF token from Antigravity process command line.
- * Only extracts two specific parameters — no other data is captured.
+ * Parse ps output into ProcessInfo objects.
+ * Exact port from UnixStrategy.parseProcessInfo.
  */
-function parseCommandLine(cmdLine: string): ConnectionInfo | null {
-    // Validate this is actually an Antigravity process
-    if (!cmdLine.includes('--extension_server_port') || !cmdLine.includes('--csrf_token')) {
-        return null;
+function parseProcessInfo(stdout: string): ProcessInfo[] {
+  const lines = stdout.split("\n").filter((line) => line.trim());
+  const currentPid = process.pid;
+  const candidates: Array<{
+    pid: number;
+    ppid: number;
+    extensionPort: number;
+    csrfToken: string;
+  }> = [];
+
+  for (const line of lines) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 3) continue;
+
+    const pid = parseInt(parts[0], 10);
+    const ppid = parseInt(parts[1], 10);
+    const cmd = parts.slice(2).join(" ");
+
+    if (isNaN(pid) || isNaN(ppid)) continue;
+
+    const portMatch = cmd.match(/--extension_server_port[=\s]+(\d+)/);
+    const tokenMatch = cmd.match(/--csrf_token[=\s]+([a-zA-Z0-9-]+)/i);
+
+    if (tokenMatch?.[1] && isAntigravityProcess(cmd)) {
+      const extensionPort = portMatch?.[1] ? parseInt(portMatch[1], 10) : 0;
+      const csrfToken = tokenMatch[1];
+      candidates.push({ pid, ppid, extensionPort, csrfToken });
     }
+  }
 
-    // Must have Antigravity identifier
-    if (!/--app_data_dir\s+antigravity\b/i.test(cmdLine)) {
-        return null;
+  // Sort: our child processes first (ppid matches current PID)
+  return candidates.sort((a, b) => {
+    if (a.ppid === currentPid) return -1;
+    if (b.ppid === currentPid) return 1;
+    return 0;
+  });
+}
+
+// ─── Port Discovery (from UnixStrategy + ProcessHunter) ──────────────
+
+/**
+ * Verify a process and find its API port.
+ * Exact logic from ProcessHunter.verifyAndConnect.
+ */
+async function verifyAndConnect(
+  info: ProcessInfo,
+): Promise<ConnectionInfo | null> {
+  const ports = await identifyPorts(info.pid);
+
+  if (ports.length > 0) {
+    const validPort = await verifyConnection(ports, info.csrfToken);
+    if (validPort) {
+      return {
+        port: validPort,
+        csrfToken: info.csrfToken,
+      };
     }
+  }
 
-    const portMatch = cmdLine.match(/--extension_server_port[=\s]+(\d+)/);
-    const tokenMatch = cmdLine.match(/--csrf_token[=\s]+([a-f0-9-]+)/i);
+  return null;
+}
 
-    if (!portMatch?.[1] || !tokenMatch?.[1]) return null;
+/**
+ * Get listening ports for a PID using lsof.
+ * Exact command from UnixStrategy.getPortListCommand (darwin).
+ */
+async function identifyPorts(pid: number): Promise<number[]> {
+  try {
+    // Exact lsof command from the original
+    const cmd = `lsof -nP -a -iTCP -sTCP:LISTEN -p ${pid} 2>/dev/null | grep -E "^\\S+\\s+${pid}\\s"`;
+    const { stdout } = await execAsync(cmd, {
+      timeout: PROCESS_CMD_TIMEOUT_MS,
+    });
+    return parseListeningPorts(stdout, pid);
+  } catch {
+    return [];
+  }
+}
 
-    const extensionPort = parseInt(portMatch[1], 10);
-    if (extensionPort <= 0 || extensionPort > 65535) return null;
+/**
+ * Parse lsof output for listening ports.
+ * Exact logic from UnixStrategy.parseListeningPorts (darwin branch).
+ */
+function parseListeningPorts(stdout: string, _pid: number): number[] {
+  const ports: number[] = [];
+  const lines = stdout.split("\n");
 
-    // The Language Server exposes the quota HTTP API on extension_server_port + 2.
-    // Port layout: extension_server_port (internal gRPC), +1 (HTTPS API), +2 (HTTP API)
-    const apiPort = extensionPort + 2;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (!line.includes("(LISTEN)")) continue;
 
-    return {
-        port: apiPort,
-        csrfToken: tokenMatch[1],
+    // Extract port from *:PORT or IP:PORT format
+    const portMatch = line.match(/[*\d.:]+:(\d+)\s+\(LISTEN\)/);
+    if (portMatch) {
+      const port = parseInt(portMatch[1], 10);
+      if (!ports.includes(port)) {
+        ports.push(port);
+      }
+    }
+  }
+
+  return ports.sort((a, b) => a - b);
+}
+
+// ─── Port Verification (from ProcessHunter.pingPort) ─────────────────
+
+/**
+ * Try each port, return the first that responds to GetUnleashData.
+ */
+async function verifyConnection(
+  ports: number[],
+  token: string,
+): Promise<number | null> {
+  for (const port of ports) {
+    if (await pingPort(port, token)) {
+      return port;
+    }
+  }
+  return null;
+}
+
+/**
+ * Ping a port with HTTPS POST to GetUnleashData.
+ * Exact logic from ProcessHunter.pingPort.
+ */
+function pingPort(port: number, token: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const options: https.RequestOptions = {
+      hostname: "127.0.0.1",
+      port,
+      path: API_ENDPOINTS.GET_UNLEASH_DATA,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Codeium-Csrf-Token": token,
+        "Connect-Protocol-Version": "1",
+      },
+      rejectUnauthorized: false,
+      timeout: PING_TIMEOUT,
+      agent: false,
     };
+
+    const req = https.request(options, (res) =>
+      resolve(res.statusCode === 200),
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.write(JSON.stringify({ wrapper_data: {} }));
+    req.end();
+  });
 }
